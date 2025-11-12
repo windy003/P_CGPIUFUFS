@@ -15,8 +15,8 @@ def is_git_repo(folder_path):
     return os.path.isdir(git_dir)
 
 
-def get_untracked_files(repo_path):
-    """获取git仓库中的untracked files"""
+def get_git_status(repo_path):
+    """获取git仓库的状态信息"""
     try:
         # 运行 git status 命令
         result = subprocess.run(
@@ -31,34 +31,67 @@ def get_untracked_files(repo_path):
             return None
 
         output = result.stdout
-        untracked_files = []
+        status_info = {
+            'modified': [],      # 已修改但未暂存
+            'staged': [],        # 已暂存
+            'untracked': []      # 未跟踪
+        }
 
-        # 解析输出，查找 Untracked files 部分
+        # 解析输出
         lines = output.split('\n')
-        in_untracked_section = False
+        current_section = None
 
         for line in lines:
-            # 检测 Untracked files 开始
-            if 'Untracked files:' in line:
-                in_untracked_section = True
+            # 检测不同的section
+            if 'Changes to be committed:' in line:
+                current_section = 'staged'
+                continue
+            elif 'Changes not staged for commit:' in line:
+                current_section = 'modified'
+                continue
+            elif 'Untracked files:' in line:
+                current_section = 'untracked'
                 continue
 
-            # 检测 Untracked files 结束
-            if in_untracked_section:
-                # 空行或其他section开始，结束untracked section
-                if line.strip() == '' or (not line.startswith('\t') and not line.startswith('  ')):
+            # 检测section结束
+            if current_section:
+                # 空行或非缩进行（不是提示信息）结束当前section
+                if line.strip() == '':
+                    # 遇到空行，可能结束section，但继续检查
+                    pass
+                elif not line.startswith('\t') and not line.startswith('  '):
                     # 检查是否是提示信息
-                    if 'use "git add' in line.lower() or 'include in what will be committed' in line.lower():
+                    if ('use "git' in line.lower() or
+                        'include in what will be committed' in line.lower() or
+                        'no changes added' in line.lower()):
                         continue
                     else:
-                        break
+                        # 非缩进的非提示行，结束section
+                        current_section = None
+                        continue
 
-                # 提取文件名（去掉前面的空格/制表符）
+                # 提取文件名
                 stripped = line.strip()
                 if stripped and not stripped.startswith('('):
-                    untracked_files.append(stripped)
+                    # 对于 modified 和 staged，需要去掉状态前缀（如 "modified:"）
+                    if current_section in ['modified', 'staged']:
+                        # 处理类似 "modified:   file.txt" 的格式
+                        if ':' in stripped:
+                            parts = stripped.split(':', 1)
+                            if len(parts) == 2:
+                                file_name = parts[1].strip()
+                                status_prefix = parts[0].strip()
+                                status_info[current_section].append(f"{status_prefix}: {file_name}")
+                        else:
+                            status_info[current_section].append(stripped)
+                    elif current_section == 'untracked':
+                        status_info[current_section].append(stripped)
 
-        return untracked_files if untracked_files else None
+        # 只返回有内容的状态信息
+        if status_info['modified'] or status_info['staged'] or status_info['untracked']:
+            return status_info
+        else:
+            return None
 
     except Exception as e:
         print(f"错误: 无法检查 {repo_path}: {e}")
@@ -75,7 +108,9 @@ def main():
     print()
 
     git_repos = []
-    repos_with_untracked = []
+    repos_with_changes = []
+    total_modified_count = 0
+    total_staged_count = 0
     total_untracked_count = 0
 
     # 遍历父目录下的所有子文件夹
@@ -91,16 +126,18 @@ def main():
             if is_git_repo(item_path):
                 git_repos.append(item)
 
-                # 获取untracked files
-                untracked_files = get_untracked_files(item_path)
+                # 获取git状态
+                status_info = get_git_status(item_path)
 
-                if untracked_files:
-                    repos_with_untracked.append({
+                if status_info:
+                    repos_with_changes.append({
                         'name': item,
                         'path': item_path,
-                        'files': untracked_files
+                        'status': status_info
                     })
-                    total_untracked_count += len(untracked_files)
+                    total_modified_count += len(status_info['modified'])
+                    total_staged_count += len(status_info['staged'])
+                    total_untracked_count += len(status_info['untracked'])
 
     except Exception as e:
         print(f"错误: {e}")
@@ -108,30 +145,51 @@ def main():
 
     # 输出结果
     print(f"找到 {len(git_repos)} 个 Git 仓库")
-    print(f"其中 {len(repos_with_untracked)} 个仓库有 untracked files")
+    print(f"其中 {len(repos_with_changes)} 个仓库有变更")
     print()
 
-    if repos_with_untracked:
+    if repos_with_changes:
         print("=" * 80)
-        print("有 Untracked Files 的仓库详情:")
+        print("有变更的仓库详情:")
         print("=" * 80)
         print()
 
-        for repo in repos_with_untracked:
+        for repo in repos_with_changes:
             print(f"📁 {repo['name']}")
             print(f"   路径: {repo['path']}")
-            print(f"   Untracked files 数量: {len(repo['files'])}")
-            print(f"   文件列表:")
-            for file in repo['files']:
-                print(f"      - {file}")
+
+            status = repo['status']
+
+            # 显示已暂存的文件
+            if status['staged']:
+                print(f"   ✓ 已暂存 (Changes to be committed): {len(status['staged'])} 个文件")
+                for file in status['staged']:
+                    print(f"      - {file}")
+
+            # 显示已修改但未暂存的文件
+            if status['modified']:
+                print(f"   ⚠ 已修改未暂存 (Changes not staged for commit): {len(status['modified'])} 个文件")
+                for file in status['modified']:
+                    print(f"      - {file}")
+
+            # 显示未跟踪的文件
+            if status['untracked']:
+                print(f"   ? 未跟踪 (Untracked files): {len(status['untracked'])} 个文件")
+                for file in status['untracked']:
+                    print(f"      - {file}")
+
             print()
 
         print("=" * 80)
-        print(f"总计: {total_untracked_count} 个 untracked files")
+        print(f"总计:")
+        print(f"  已暂存: {total_staged_count} 个文件")
+        print(f"  已修改未暂存: {total_modified_count} 个文件")
+        print(f"  未跟踪: {total_untracked_count} 个文件")
         print("=" * 80)
     else:
-        print("✓ 所有Git仓库都没有untracked files")
+        print("✓ 所有Git仓库都是干净的状态（没有变更）")
 
 
 if __name__ == '__main__':
     main()
+    input("Press Enter to continue...")
