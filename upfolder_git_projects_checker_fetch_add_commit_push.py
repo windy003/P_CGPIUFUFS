@@ -416,7 +416,7 @@ def main():
     print(f"发现 {total} 个 Git 仓库，开始并行获取状态...\n")
 
     # 并行处理所有仓库（fetch 是主要耗时，I/O 密集用线程池）
-    max_workers = min(total, 16) if total > 0 else 1
+    max_workers = min(total, 32) if total > 0 else 1
     print_lock = threading.Lock()
     progress_counter = [0]
     repo_results = []
@@ -569,7 +569,7 @@ def main():
             print()
 
             push_lock = threading.Lock()
-            push_workers = min(len(repos_with_changes), 8)
+            push_workers = min(len(repos_with_changes), 16)
             push_results = []  # list of (repo, results)
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=push_workers) as executor:
