@@ -6,6 +6,8 @@
 
 import os
 import subprocess
+import concurrent.futures
+import threading
 from pathlib import Path
 from urllib.parse import quote
 
@@ -350,6 +352,36 @@ def scan_directory_for_git_repos(directory):
     return git_repos
 
 
+def process_repo(repo_path, progress_counter, total, print_lock):
+    """并行处理单个仓库：获取状态、fetch、获取同步状态"""
+    repo_name = os.path.basename(repo_path)
+    status_info = get_git_status(repo_path)
+
+    sync_status = get_remote_sync_status(repo_path)
+    if sync_status.get('has_remote'):
+        do_git_fetch(repo_path)
+        sync_status = get_remote_sync_status(repo_path)
+
+    with print_lock:
+        progress_counter[0] += 1
+        print(f"\r正在处理 ({progress_counter[0]}/{total}): {repo_name}{'':30}", end='', flush=True)
+
+    return {
+        'name': repo_name,
+        'path': repo_path,
+        'status': status_info,
+        'sync': sync_status,
+    }
+
+
+def push_repo(repo, commit_msg, print_lock):
+    """并行执行单个仓库的 add/commit/push"""
+    results = do_git_add_commit_push(repo['path'], commit_msg)
+    with print_lock:
+        print(f"  完成: {repo['name']} — push {'✓' if results['push'] else '✗'}")
+    return repo, results
+
+
 def main():
     # 从 .env 文件读取目标目录
     script_dir = Path(__file__).resolve().parent
@@ -372,7 +404,6 @@ def main():
     print("=" * 80)
     print()
 
-    git_repos = []
     repos_with_changes = []
     repos_with_sync_issues = []
     total_modified_count = 0
@@ -381,63 +412,62 @@ def main():
     total_ahead = 0
     total_behind = 0
 
-    # 扫描父目录下的所有git仓库（递归）
-    print(f"正在扫描...")
+    print("正在扫描目录...")
     repos_in_dir = scan_directory_for_git_repos(parent_dir)
+    total = len(repos_in_dir)
+    print(f"发现 {total} 个 Git 仓库，开始并行获取状态...\n")
 
-    # 检查每个git仓库的状态
-    for repo_path in repos_in_dir:
-        repo_name = os.path.basename(repo_path)
-        git_repos.append(repo_path)
+    # 并行处理所有仓库（fetch 是主要耗时，I/O 密集用线程池）
+    max_workers = min(total, 16) if total > 0 else 1
+    print_lock = threading.Lock()
+    progress_counter = [0]
+    repo_results = []
 
-        # 获取git状态
-        status_info = get_git_status(repo_path)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(process_repo, rp, progress_counter, total, print_lock): rp
+            for rp in repos_in_dir
+        }
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                repo_results.append(future.result())
+            except Exception as e:
+                repo_path = futures[future]
+                with print_lock:
+                    print(f"\n  ⚠ 处理 {repo_path} 时出错: {e}")
+
+    # 清除进度行
+    print("\r" + " " * 70 + "\r", end='', flush=True)
+
+    # 按原始顺序排列结果
+    order = {rp: i for i, rp in enumerate(repos_in_dir)}
+    repo_results.sort(key=lambda r: order.get(r['path'], 0))
+
+    # 整理统计数据
+    for r in repo_results:
+        status_info = r['status']
+        sync_status = r['sync']
 
         if status_info:
-            repos_with_changes.append({
-                'name': repo_name,
-                'path': repo_path,
-                'status': status_info
-            })
+            repos_with_changes.append({'name': r['name'], 'path': r['path'], 'status': status_info})
             total_modified_count += len(status_info['modified'])
             total_staged_count += len(status_info['staged'])
             total_untracked_count += len(status_info['untracked'])
 
-        # 获取远程同步状态（先 fetch 获取最新信息）
-        # 先检查是否有远程
-        sync_status = get_remote_sync_status(repo_path)
         if sync_status.get('has_remote'):
-            # 执行 git fetch 并显示进度
-            print(f"\r正在获取远程信息: {repo_name}...                    ", end='', flush=True)
-            do_git_fetch(repo_path)
-            # 重新获取同步状态
-            sync_status = get_remote_sync_status(repo_path)
-
-            # 只记录有问题的仓库（未同步的）
             status = sync_status.get('status')
             if status and status != 'synced':
-                repos_with_sync_issues.append({
-                    'name': repo_name,
-                    'path': repo_path,
-                    'sync': sync_status
-                })
+                repos_with_sync_issues.append({'name': r['name'], 'path': r['path'], 'sync': sync_status})
                 total_ahead += sync_status.get('ahead', 0)
                 total_behind += sync_status.get('behind', 0)
             elif not status:
-                # 有远程但没有追踪分支等情况
-                repos_with_sync_issues.append({
-                    'name': repo_name,
-                    'path': repo_path,
-                    'sync': sync_status
-                })
+                repos_with_sync_issues.append({'name': r['name'], 'path': r['path'], 'sync': sync_status})
 
-    # 清除进度显示
-    print("\r" + " " * 60 + "\r", end='', flush=True)
     print()
     print("=" * 80)
 
     # 输出结果
-    print(f"找到 {len(git_repos)} 个 Git 仓库")
+    print(f"找到 {total} 个 Git 仓库")
     print(f"其中 {len(repos_with_changes)} 个仓库有本地变更")
     print(f"其中 {len(repos_with_sync_issues)} 个仓库与远程不同步")
     print()
@@ -540,31 +570,44 @@ def main():
             print("=" * 80)
             print()
 
+            push_lock = threading.Lock()
+            push_workers = min(len(repos_with_changes), 8)
+            push_results = []  # list of (repo, results)
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=push_workers) as executor:
+                futures = {
+                    executor.submit(push_repo, repo, commit_msg, push_lock): repo
+                    for repo in repos_with_changes
+                }
+                for future in concurrent.futures.as_completed(futures):
+                    try:
+                        push_results.append(future.result())
+                    except Exception as e:
+                        repo = futures[future]
+                        push_results.append((repo, {'add': False, 'commit': False, 'push': False, 'errors': [str(e)]}))
+
+            print()
+
+            # 按原始顺序打印详细结果
+            repo_order = {repo['path']: i for i, repo in enumerate(repos_with_changes)}
+            push_results.sort(key=lambda x: repo_order.get(x[0]['path'], 0))
+
             success_count = 0
             fail_count = 0
 
-            for repo in repos_with_changes:
-                repo_name = repo['name']
-                repo_path = repo['path']
-                print(f"📁 {repo_name}")
-                print(f"   路径: {repo_path}")
-
-                results = do_git_add_commit_push(repo_path, commit_msg)
-
-                # 显示每一步的结果
+            for repo, results in push_results:
+                print(f"📁 {repo['name']}")
+                print(f"   路径: {repo['path']}")
                 print(f"   git add .    : {'✓ 成功' if results['add'] else '✗ 失败'}")
                 print(f"   git commit   : {'✓ 成功' if results['commit'] else '✗ 失败'}")
                 print(f"   git push     : {'✓ 成功' if results['push'] else '✗ 失败'}")
-
                 if results['errors']:
                     for err in results['errors']:
                         print(f"   ⚠ {err}")
-
                 if results['push']:
                     success_count += 1
                 else:
                     fail_count += 1
-
                 print()
 
             print("=" * 80)
