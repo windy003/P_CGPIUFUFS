@@ -353,14 +353,12 @@ def scan_directory_for_git_repos(directory):
 
 
 def process_repo(repo_path, progress_counter, total, print_lock):
-    """并行处理单个仓库：获取状态、fetch、获取同步状态"""
+    """并行处理单个仓库：fetch、获取状态、获取同步状态"""
     repo_name = os.path.basename(repo_path)
-    status_info = get_git_status(repo_path)
 
+    do_git_fetch(repo_path)
+    status_info = get_git_status(repo_path)
     sync_status = get_remote_sync_status(repo_path)
-    if sync_status.get('has_remote'):
-        do_git_fetch(repo_path)
-        sync_status = get_remote_sync_status(repo_path)
 
     with print_lock:
         progress_counter[0] += 1
